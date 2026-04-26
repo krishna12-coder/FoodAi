@@ -25,10 +25,20 @@ interface UploadRecord {
   uploaded_at: string;
 }
 
-interface PendingUploadPayload {
+interface SelectedUpload {
+  id: string;
+  file: File;
+  preview: string;
+}
+
+interface PendingUploadFilePayload {
   fileName: string;
   fileType: string;
   fileDataUrl: string;
+}
+
+interface PendingUploadPayload {
+  files: PendingUploadFilePayload[];
   recipientEmail: string;
   showEmailStep: boolean;
 }
@@ -51,13 +61,20 @@ function dataUrlToFile(dataUrl: string, fileName: string, fileType: string) {
   return new File([bytes], fileName, { type: mimeType });
 }
 
+function createSelectedUpload(file: File, suffix: string) {
+  return {
+    id: `${file.name}-${file.size}-${file.lastModified}-${suffix}`,
+    file,
+    preview: URL.createObjectURL(file),
+  };
+}
+
 export default function UploadPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [uploads, setUploads] = useState<UploadRecord[]>([]);
   const [loadingUploads, setLoadingUploads] = useState(true);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
+  const [selectedUploads, setSelectedUploads] = useState<SelectedUpload[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [successMsg, setSuccessMsg] = useState('');
   const [error, setError] = useState('');
@@ -69,7 +86,9 @@ export default function UploadPage() {
 
   const verifiedEmail = session?.user.email ?? '';
   const uploadCount = uploads.length;
-  const limitReached = uploadCount >= MAX_UPLOADS;
+  const remainingUploads = Math.max(MAX_UPLOADS - uploadCount, 0);
+  const queuedUploadCount = selectedUploads.length;
+  const limitReached = remainingUploads === 0;
 
   const clearPendingUpload = useCallback(() => {
     window.sessionStorage.removeItem(PENDING_UPLOAD_STORAGE_KEY);
@@ -98,18 +117,26 @@ export default function UploadPage() {
   );
 
   const persistPendingUpload = useCallback(
-    async (file: File, nextRecipientEmail: string, nextShowEmailStep: boolean) => {
-      const fileDataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(new Error('Failed to save the selected photo.'));
-        reader.readAsDataURL(file);
-      });
+    async (files: File[], nextRecipientEmail: string, nextShowEmailStep: boolean) => {
+      const serializedFiles = await Promise.all(
+        files.map(
+          (file) =>
+            new Promise<PendingUploadFilePayload>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () =>
+                resolve({
+                  fileName: file.name,
+                  fileType: file.type,
+                  fileDataUrl: String(reader.result),
+                });
+              reader.onerror = () => reject(new Error('Failed to save the selected photos.'));
+              reader.readAsDataURL(file);
+            })
+        )
+      );
 
       const payload: PendingUploadPayload = {
-        fileName: file.name,
-        fileType: file.type,
-        fileDataUrl,
+        files: serializedFiles,
         recipientEmail: nextRecipientEmail,
         showEmailStep: nextShowEmailStep,
       };
@@ -144,11 +171,11 @@ export default function UploadPage() {
 
   useEffect(() => {
     return () => {
-      if (preview) {
-        URL.revokeObjectURL(preview);
-      }
+      selectedUploads.forEach((upload) => URL.revokeObjectURL(upload.preview));
     };
-  }, [preview]);
+    // We revoke previews explicitly when files are removed and once on unmount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const savedUpload = window.sessionStorage.getItem(PENDING_UPLOAD_STORAGE_KEY);
@@ -158,9 +185,17 @@ export default function UploadPage() {
 
     try {
       const payload = JSON.parse(savedUpload) as PendingUploadPayload;
-      const restoredFile = dataUrlToFile(payload.fileDataUrl, payload.fileName, payload.fileType);
-      setSelectedFile(restoredFile);
-      setPreview(URL.createObjectURL(restoredFile));
+      const restoredUploads = payload.files.map((pendingFile, index) => {
+        const restoredFile = dataUrlToFile(
+          pendingFile.fileDataUrl,
+          pendingFile.fileName,
+          pendingFile.fileType
+        );
+
+        return createSelectedUpload(restoredFile, `restored-${index}`);
+      });
+
+      setSelectedUploads(restoredUploads);
       setRecipientEmail((currentEmail) => currentEmail || payload.recipientEmail);
       setShowEmailStep(payload.showEmailStep);
     } catch {
@@ -242,59 +277,124 @@ export default function UploadPage() {
     }
   }
 
-  async function handleFileSelect(file: File) {
-    if (!file.type.startsWith('image/')) {
-      setError('Please select an image file (JPEG, PNG, WebP, GIF).');
-      return;
-    }
-    if (file.size > 10 * 1024 * 1024) {
-      setError('File size must be under 10 MB.');
+  async function syncPendingUploads(nextSelectedUploads: SelectedUpload[]) {
+    if (nextSelectedUploads.length === 0) {
+      clearPendingUpload();
       return;
     }
 
-    if (preview) {
-      URL.revokeObjectURL(preview);
+    await persistPendingUpload(
+      nextSelectedUploads.map((upload) => upload.file),
+      recipientEmail.trim(),
+      showEmailStep
+    );
+  }
+
+  async function handleFileSelect(fileList: FileList | File[]) {
+    const incomingFiles = Array.from(fileList);
+    if (incomingFiles.length === 0) {
+      return;
     }
 
-    setError('');
+    const availableSlots = MAX_UPLOADS - uploadCount - selectedUploads.length;
+    if (availableSlots <= 0) {
+      setError(`You can upload up to ${MAX_UPLOADS} photos.`);
+      return;
+    }
+
+    const validFiles: File[] = [];
+
+    for (const file of incomingFiles) {
+      if (!file.type.startsWith('image/')) {
+        setError('Please select only image files (JPEG, PNG, WebP, GIF).');
+        return;
+      }
+
+      if (file.size > 10 * 1024 * 1024) {
+        setError(`"${file.name}" is over the 10 MB limit.`);
+        return;
+      }
+
+      validFiles.push(file);
+    }
+
+    const filesToAdd = validFiles.slice(0, availableSlots);
+    if (filesToAdd.length === 0) {
+      setError(`You can upload up to ${MAX_UPLOADS} photos.`);
+      return;
+    }
+
+    const nextSelectedUploads = [
+      ...selectedUploads,
+      ...filesToAdd.map((file, index) => createSelectedUpload(file, `${Date.now()}-${index}`)),
+    ];
+
+    setError(
+      validFiles.length > availableSlots
+        ? `Only ${availableSlots} more photo${availableSlots === 1 ? '' : 's'} can be added.`
+        : ''
+    );
     setSuccessMsg('');
-    setSelectedFile(file);
-    setPreview(URL.createObjectURL(file));
+    setSelectedUploads(nextSelectedUploads);
 
     try {
-      await persistPendingUpload(file, recipientEmail.trim(), showEmailStep);
+      await syncPendingUploads(nextSelectedUploads);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save the selected photo.');
+      setError(err instanceof Error ? err.message : 'Failed to save the selected photos.');
     }
   }
 
   async function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (file) await handleFileSelect(file);
+    if (e.target.files?.length) {
+      await handleFileSelect(e.target.files);
+    }
+    e.target.value = '';
   }
 
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) {
-      await handleFileSelect(file);
-    }
-  }, [handleFileSelect]);
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+      if (e.dataTransfer.files?.length) {
+        await handleFileSelect(e.dataTransfer.files);
+      }
+    },
+    [handleFileSelect]
+  );
 
   function clearSelection() {
-    setSelectedFile(null);
-    if (preview) {
-      URL.revokeObjectURL(preview);
-    }
-    setPreview(null);
+    selectedUploads.forEach((upload) => URL.revokeObjectURL(upload.preview));
+    setSelectedUploads([]);
     setError('');
     clearPendingUpload();
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  }
+
+  async function removeSelectedUpload(id: string) {
+    const uploadToRemove = selectedUploads.find((upload) => upload.id === id);
+    if (!uploadToRemove) {
+      return;
+    }
+
+    URL.revokeObjectURL(uploadToRemove.preview);
+    const nextSelectedUploads = selectedUploads.filter((upload) => upload.id !== id);
+    setSelectedUploads(nextSelectedUploads);
+    setError('');
+    setSuccessMsg('');
+
+    try {
+      await syncPendingUploads(nextSelectedUploads);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update the selected photos.');
+    }
   }
 
   async function uploadVerifiedPhoto() {
-    if (!selectedFile || limitReached) return;
+    if (selectedUploads.length === 0 || limitReached) {
+      return;
+    }
 
     const {
       data: { session: currentSession },
@@ -306,40 +406,46 @@ export default function UploadPage() {
       throw new Error('Please verify your email with the magic link before uploading.');
     }
 
-    const timestamp = Date.now();
-    const safeName = selectedFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const filePath = `${userId}/${timestamp}-${safeName}`;
-
-    const { error: uploadError } = await supabase.storage
-      .from('food-photos')
-      .upload(filePath, selectedFile, { upsert: false });
-
-    if (uploadError) throw uploadError;
-
     const token = currentSession?.access_token;
-    if (!token) throw new Error('Email verification is required before upload.');
-
-    const { data: fnData, error: fnError } = await supabase.functions.invoke('notify-upload', {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-      body: {
-        filePath,
-        fileName: selectedFile.name,
-        userEmail: recipientEmail.trim(),
-      },
-    });
-
-    if (fnError) {
-      throw new Error(fnError.message || 'Upload notification failed');
+    if (!token) {
+      throw new Error('Email verification is required before upload.');
     }
 
-    if (fnData && typeof fnData === 'object' && 'error' in fnData && fnData.error) {
-      throw new Error(String(fnData.error));
+    for (const [index, selectedUpload] of selectedUploads.entries()) {
+      const timestamp = Date.now() + index;
+      const safeName = selectedUpload.file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filePath = `${userId}/${timestamp}-${safeName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('food-photos')
+        .upload(filePath, selectedUpload.file, { upsert: false });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const { data: fnData, error: fnError } = await supabase.functions.invoke('notify-upload', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        body: {
+          filePath,
+          fileName: selectedUpload.file.name,
+          userEmail: recipientEmail.trim(),
+        },
+      });
+
+      if (fnError) {
+        throw new Error(fnError.message || 'Upload notification failed');
+      }
+
+      if (fnData && typeof fnData === 'object' && 'error' in fnData && fnData.error) {
+        throw new Error(String(fnData.error));
+      }
     }
 
     setSuccessMsg(
-      `Your photo was submitted. We'll deliver the upgraded image to ${recipientEmail.trim()}.`
+      `${selectedUploads.length} photo${selectedUploads.length === 1 ? '' : 's'} submitted. We'll deliver the upgraded image${selectedUploads.length === 1 ? '' : 's'} to ${recipientEmail.trim()}.`
     );
     clearSelection();
     setShowEmailStep(false);
@@ -348,7 +454,9 @@ export default function UploadPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!selectedFile || limitReached) return;
+    if (selectedUploads.length === 0 || limitReached) {
+      return;
+    }
 
     if (!showEmailStep) {
       const nextRecipientEmail = session?.user.email ?? recipientEmail;
@@ -356,9 +464,11 @@ export default function UploadPage() {
       setShowEmailStep(true);
       setError('');
       setSuccessMsg('');
-      if (selectedFile) {
-        await persistPendingUpload(selectedFile, nextRecipientEmail.trim(), true);
-      }
+      await persistPendingUpload(
+        selectedUploads.map((upload) => upload.file),
+        nextRecipientEmail.trim(),
+        true
+      );
       return;
     }
 
@@ -383,11 +493,8 @@ export default function UploadPage() {
     await supabase.auth.signOut();
     setSession(null);
     setUploads([]);
-    setSelectedFile(null);
-    if (preview) {
-      URL.revokeObjectURL(preview);
-    }
-    setPreview(null);
+    selectedUploads.forEach((upload) => URL.revokeObjectURL(upload.preview));
+    setSelectedUploads([]);
     setSuccessMsg('');
     setError('');
     setShowEmailStep(false);
@@ -440,48 +547,6 @@ export default function UploadPage() {
           </p>
         </div>
 
-        <div className="bg-white rounded-2xl border border-[#F0E4D4] p-5 shadow-sm">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <Camera className="w-5 h-5 text-[#E85D26]" />
-              <span className="font-semibold text-[#2C1810]">Photo Submissions</span>
-            </div>
-            <span className="text-sm font-medium text-[#6B4226]">
-              {loadingUploads ? '...' : uploadCount} / {MAX_UPLOADS} used
-            </span>
-          </div>
-          <div className="w-full bg-[#F0E4D4] rounded-full h-2.5 overflow-hidden">
-            <div
-              className="h-full rounded-full transition-all duration-500"
-              style={{
-                width: `${Math.min((uploadCount / MAX_UPLOADS) * 100, 100)}%`,
-                background: limitReached
-                  ? '#DC2626'
-                  : uploadCount === 2
-                    ? '#D97706'
-                    : '#E85D26',
-              }}
-            />
-          </div>
-          {!loadingUploads && uploads.length > 0 && (
-            <ul className="mt-4 space-y-2">
-              {uploads.map((u, i) => (
-                <li key={u.id} className="flex items-center gap-3 text-sm text-[#6B4226]">
-                  <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
-                  <span className="truncate flex-1">{u.file_name}</span>
-                  <span className="text-[#C8A882] shrink-0">
-                    Photo {i + 1} •{' '}
-                    {new Date(u.uploaded_at).toLocaleDateString(undefined, {
-                      month: 'short',
-                      day: 'numeric',
-                    })}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
         {!loadingUploads && limitReached && (
           <div className="bg-gradient-to-br from-[#2C1810] to-[#6B2F10] rounded-2xl p-8 text-center shadow-xl">
             <div className="w-14 h-14 rounded-2xl bg-yellow-400/20 flex items-center justify-center mx-auto mb-4">
@@ -489,8 +554,8 @@ export default function UploadPage() {
             </div>
             <h2 className="text-2xl font-bold text-white mb-2">Unlock Unlimited Submissions</h2>
             <p className="text-white/70 max-w-md mx-auto mb-6">
-              You&apos;ve used all 3 free photo submissions. Upgrade to Pro for unlimited AI
-              enhancements, priority processing, and premium filters.
+              You&apos;ve used all {MAX_UPLOADS} free photo submissions. Upgrade to Pro for unlimited
+              AI enhancements, priority processing, and premium filters.
             </p>
             <div className="flex flex-col sm:flex-row gap-3 justify-center">
               <button className="bg-yellow-400 hover:bg-yellow-300 text-[#2C1810] font-bold px-6 py-3 rounded-xl flex items-center justify-center gap-2 transition shadow-lg shadow-yellow-400/20">
@@ -506,7 +571,7 @@ export default function UploadPage() {
 
         {!loadingUploads && !limitReached && (
           <form onSubmit={handleSubmit} className="space-y-4">
-            {!preview ? (
+            {selectedUploads.length === 0 ? (
               <div
                 onDragOver={(e) => {
                   e.preventDefault();
@@ -518,15 +583,17 @@ export default function UploadPage() {
                 className={`
                   relative border-2 border-dashed rounded-2xl p-10 text-center transition-all duration-200
                   cursor-pointer
-                  ${isDragging
-                    ? 'border-[#E85D26] bg-[#FFF0E6] scale-[1.01]'
-                    : 'border-[#D4B896] bg-white hover:border-[#E85D26] hover:bg-[#FFF8F3]'
+                  ${
+                    isDragging
+                      ? 'border-[#E85D26] bg-[#FFF0E6] scale-[1.01]'
+                      : 'border-[#D4B896] bg-white hover:border-[#E85D26] hover:bg-[#FFF8F3]'
                   }
                 `}
               >
                 <input
                   ref={fileInputRef}
                   type="file"
+                  multiple
                   accept="image/jpeg,image/jpg,image/png,image/webp,image/gif"
                   className="hidden"
                   onChange={handleInputChange}
@@ -537,50 +604,85 @@ export default function UploadPage() {
                   </div>
                   <div>
                     <p className="font-semibold text-[#2C1810] text-lg">
-                      {isDragging ? 'Drop your photo here' : 'Click or drag a photo here'}
+                      {isDragging ? 'Drop your photos here' : 'Click or drag photos here'}
                     </p>
                     <p className="text-[#9B6645] text-sm mt-1">
-                      JPEG, PNG, WebP, GIF • Max 10 MB
+                      JPEG, PNG, WebP, GIF • Up to {remainingUploads} photo
+                      {remainingUploads === 1 ? '' : 's'} • Max 10 MB each
                     </p>
                   </div>
                 </div>
               </div>
             ) : (
-              <div className="relative bg-white rounded-2xl border border-[#F0E4D4] overflow-hidden shadow-sm">
-                <div className="relative">
-                  <img
-                    src={preview}
-                    alt="Preview"
-                    className="w-full max-h-[400px] object-contain bg-[#F9F3EB]"
-                  />
-                  <button
-                    type="button"
-                    onClick={clearSelection}
-                    className="absolute top-3 right-3 w-8 h-8 bg-black/50 hover:bg-black/70 text-white rounded-full flex items-center justify-center transition"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
+              <div className="space-y-4">
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  {selectedUploads.map((upload) => (
+                    <div
+                      key={upload.id}
+                      className="relative bg-white rounded-2xl border border-[#F0E4D4] overflow-hidden shadow-sm"
+                    >
+                      <div className="relative">
+                        <img
+                          src={upload.preview}
+                          alt={upload.file.name}
+                          className="w-full h-48 object-cover bg-[#F9F3EB]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void removeSelectedUpload(upload.id);
+                          }}
+                          className="absolute top-3 right-3 w-8 h-8 bg-black/50 hover:bg-black/70 text-white rounded-full flex items-center justify-center transition"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <div className="p-4 flex items-center gap-3">
+                        <ImagePlus className="w-5 h-5 text-[#E85D26] shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-[#2C1810] truncate">
+                            {upload.file.name}
+                          </p>
+                          <p className="text-xs text-[#9B6645]">
+                            {(upload.file.size / 1024 / 1024).toFixed(2)} MB
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                <div className="p-4 flex items-center gap-3">
-                  <ImagePlus className="w-5 h-5 text-[#E85D26] shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-[#2C1810] truncate">
-                      {selectedFile?.name}
+
+                <div className="bg-white rounded-2xl border border-[#F0E4D4] p-4 flex flex-col sm:flex-row sm:items-center gap-3 shadow-sm">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-[#2C1810]">
+                      {queuedUploadCount} photo{queuedUploadCount === 1 ? '' : 's'} ready to submit
                     </p>
-                    <p className="text-xs text-[#9B6645]">
-                      {selectedFile ? `${(selectedFile.size / 1024 / 1024).toFixed(2)} MB` : ''}
+                    <p className="text-xs text-[#9B6645] mt-1">
+                      You can still add {Math.max(remainingUploads - queuedUploadCount, 0)} more
+                      photo{Math.max(remainingUploads - queuedUploadCount, 0) === 1 ? '' : 's'}.
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="text-sm text-[#E85D26] hover:underline font-medium shrink-0"
-                  >
-                    Change
-                  </button>
+                  <div className="flex gap-3">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={queuedUploadCount >= remainingUploads}
+                      className="text-sm text-[#E85D26] hover:underline font-medium shrink-0 disabled:opacity-50 disabled:no-underline"
+                    >
+                      Add more
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearSelection}
+                      className="text-sm text-[#9B6645] hover:text-[#E85D26] font-medium shrink-0"
+                    >
+                      Clear all
+                    </button>
+                  </div>
                   <input
                     ref={fileInputRef}
                     type="file"
+                    multiple
                     accept="image/jpeg,image/jpg,image/png,image/webp,image/gif"
                     className="hidden"
                     onChange={handleInputChange}
@@ -593,7 +695,7 @@ export default function UploadPage() {
               <div className="bg-white rounded-2xl border border-[#F0E4D4] p-6 shadow-sm space-y-4">
                 <div>
                   <h2 className="text-lg font-semibold text-[#2C1810]">
-                    Where should we send the upgraded photo?
+                    Where should we send the upgraded photo{queuedUploadCount === 1 ? '' : 's'}?
                   </h2>
                   <p className="text-sm text-[#9B6645] mt-1">
                     We&apos;ll verify this email with a magic link before finishing the submission.
@@ -660,6 +762,7 @@ export default function UploadPage() {
                 {error}
               </div>
             )}
+
             {successMsg && (
               <div className="bg-green-50 border border-green-200 text-green-700 text-sm rounded-xl px-4 py-3 flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 shrink-0" />
@@ -669,21 +772,23 @@ export default function UploadPage() {
 
             <button
               type="submit"
-              disabled={!selectedFile || submitting || authLoading}
+              disabled={selectedUploads.length === 0 || submitting || authLoading}
               className="w-full bg-[#E85D26] hover:bg-[#CF4F1F] disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-4 rounded-xl flex items-center justify-center gap-2 transition-all duration-200 shadow-lg hover:shadow-[#E85D26]/30 text-base"
             >
               {submitting ? (
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  Submitting photo...
+                  Submitting photo{queuedUploadCount === 1 ? '' : 's'}...
                 </>
               ) : (
                 <>
                   <Upload className="w-5 h-5" />
-                  {showEmailStep ? 'Finish Submission' : 'Submit Photo'}
+                  {showEmailStep
+                    ? `Finish Submission${queuedUploadCount > 1 ? ` (${queuedUploadCount} photos)` : ''}`
+                    : `Submit Photo${queuedUploadCount === 1 ? '' : 's'}`}
                   {uploadCount > 0 && (
                     <span className="ml-1 text-white/70 text-sm font-normal">
-                      ({MAX_UPLOADS - uploadCount} left)
+                      ({remainingUploads} left)
                     </span>
                   )}
                 </>
@@ -699,12 +804,51 @@ export default function UploadPage() {
           <div>
             <h3 className="font-semibold text-[#2C1810] text-sm">How it works</h3>
             <p className="text-[#9B6645] text-sm mt-1 leading-relaxed">
-              Upload your food photo first. When you submit it, we&apos;ll ask where to send the
-              upgraded version and verify that email with a magic link before finishing the
+              Upload your food photos first. When you submit them, we&apos;ll ask where to send the
+              upgraded versions and verify that email with a magic link before finishing the
               submission.
             </p>
           </div>
         </div>
+
+        {!loadingUploads && uploads.length > 0 && (
+          <div className="bg-white rounded-2xl border border-[#F0E4D4] p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Camera className="w-5 h-5 text-[#E85D26]" />
+                <span className="font-semibold text-[#2C1810]">Photo Submissions</span>
+              </div>
+              <span className="text-sm font-medium text-[#6B4226]">
+                {uploadCount} / {MAX_UPLOADS} used
+              </span>
+            </div>
+            <div className="w-full bg-[#F0E4D4] rounded-full h-2.5 overflow-hidden">
+              <div
+                className="h-full rounded-full transition-all duration-500"
+                style={{
+                  width: `${Math.min((uploadCount / MAX_UPLOADS) * 100, 100)}%`,
+                  background:
+                    limitReached ? '#DC2626' : uploadCount === 2 ? '#D97706' : '#E85D26',
+                }}
+              />
+            </div>
+            <ul className="mt-4 space-y-2">
+              {uploads.map((u, i) => (
+                <li key={u.id} className="flex items-center gap-3 text-sm text-[#6B4226]">
+                  <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
+                  <span className="truncate flex-1">{u.file_name}</span>
+                  <span className="text-[#C8A882] shrink-0">
+                    Photo {i + 1} •{' '}
+                    {new Date(u.uploaded_at).toLocaleDateString(undefined, {
+                      month: 'short',
+                      day: 'numeric',
+                    })}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </main>
     </div>
   );
