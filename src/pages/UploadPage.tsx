@@ -17,11 +17,38 @@ import {
 } from 'lucide-react';
 
 const MAX_UPLOADS = 5;
+const PENDING_UPLOAD_STORAGE_KEY = 'foodsnap-pending-upload';
 
 interface UploadRecord {
   id: string;
   file_name: string;
   uploaded_at: string;
+}
+
+interface PendingUploadPayload {
+  fileName: string;
+  fileType: string;
+  fileDataUrl: string;
+  recipientEmail: string;
+  showEmailStep: boolean;
+}
+
+function dataUrlToFile(dataUrl: string, fileName: string, fileType: string) {
+  const [header, base64Data] = dataUrl.split(',');
+  if (!header || !base64Data) {
+    throw new Error('Invalid saved upload data.');
+  }
+
+  const mimeMatch = header.match(/data:(.*?);base64/);
+  const mimeType = fileType || mimeMatch?.[1] || 'application/octet-stream';
+  const binary = window.atob(base64Data);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  return new File([bytes], fileName, { type: mimeType });
 }
 
 export default function UploadPage() {
@@ -43,6 +70,54 @@ export default function UploadPage() {
   const verifiedEmail = session?.user.email ?? '';
   const uploadCount = uploads.length;
   const limitReached = uploadCount >= MAX_UPLOADS;
+
+  const clearPendingUpload = useCallback(() => {
+    window.sessionStorage.removeItem(PENDING_UPLOAD_STORAGE_KEY);
+  }, []);
+
+  const updatePendingUploadMetadata = useCallback(
+    (nextRecipientEmail: string, nextShowEmailStep: boolean) => {
+      const savedUpload = window.sessionStorage.getItem(PENDING_UPLOAD_STORAGE_KEY);
+      if (!savedUpload) {
+        return;
+      }
+
+      try {
+        const payload = JSON.parse(savedUpload) as PendingUploadPayload;
+        const nextPayload: PendingUploadPayload = {
+          ...payload,
+          recipientEmail: nextRecipientEmail,
+          showEmailStep: nextShowEmailStep,
+        };
+        window.sessionStorage.setItem(PENDING_UPLOAD_STORAGE_KEY, JSON.stringify(nextPayload));
+      } catch {
+        clearPendingUpload();
+      }
+    },
+    [clearPendingUpload]
+  );
+
+  const persistPendingUpload = useCallback(
+    async (file: File, nextRecipientEmail: string, nextShowEmailStep: boolean) => {
+      const fileDataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('Failed to save the selected photo.'));
+        reader.readAsDataURL(file);
+      });
+
+      const payload: PendingUploadPayload = {
+        fileName: file.name,
+        fileType: file.type,
+        fileDataUrl,
+        recipientEmail: nextRecipientEmail,
+        showEmailStep: nextShowEmailStep,
+      };
+
+      window.sessionStorage.setItem(PENDING_UPLOAD_STORAGE_KEY, JSON.stringify(payload));
+    },
+    []
+  );
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session: currentSession } }) => {
@@ -74,6 +149,24 @@ export default function UploadPage() {
       }
     };
   }, [preview]);
+
+  useEffect(() => {
+    const savedUpload = window.sessionStorage.getItem(PENDING_UPLOAD_STORAGE_KEY);
+    if (!savedUpload) {
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(savedUpload) as PendingUploadPayload;
+      const restoredFile = dataUrlToFile(payload.fileDataUrl, payload.fileName, payload.fileType);
+      setSelectedFile(restoredFile);
+      setPreview(URL.createObjectURL(restoredFile));
+      setRecipientEmail((currentEmail) => currentEmail || payload.recipientEmail);
+      setShowEmailStep(payload.showEmailStep);
+    } catch {
+      clearPendingUpload();
+    }
+  }, [clearPendingUpload]);
 
   const fetchUploads = useCallback(async () => {
     if (!session?.user.id) {
@@ -116,6 +209,8 @@ export default function UploadPage() {
       return;
     }
 
+    updatePendingUploadMetadata(email, true);
+
     setSendingMagicLink(true);
     setError('');
     setSuccessMsg('');
@@ -147,7 +242,7 @@ export default function UploadPage() {
     }
   }
 
-  function handleFileSelect(file: File) {
+  async function handleFileSelect(file: File) {
     if (!file.type.startsWith('image/')) {
       setError('Please select an image file (JPEG, PNG, WebP, GIF).');
       return;
@@ -165,19 +260,27 @@ export default function UploadPage() {
     setSuccessMsg('');
     setSelectedFile(file);
     setPreview(URL.createObjectURL(file));
+
+    try {
+      await persistPendingUpload(file, recipientEmail.trim(), showEmailStep);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save the selected photo.');
+    }
   }
 
-  function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (file) handleFileSelect(file);
+    if (file) await handleFileSelect(file);
   }
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
-    if (file) handleFileSelect(file);
-  }, [preview]);
+    if (file) {
+      await handleFileSelect(file);
+    }
+  }, [handleFileSelect]);
 
   function clearSelection() {
     setSelectedFile(null);
@@ -186,6 +289,7 @@ export default function UploadPage() {
     }
     setPreview(null);
     setError('');
+    clearPendingUpload();
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
@@ -247,12 +351,14 @@ export default function UploadPage() {
     if (!selectedFile || limitReached) return;
 
     if (!showEmailStep) {
-      if (session?.user.email) {
-        setRecipientEmail(session.user.email);
-      }
+      const nextRecipientEmail = session?.user.email ?? recipientEmail;
+      setRecipientEmail(nextRecipientEmail);
       setShowEmailStep(true);
       setError('');
       setSuccessMsg('');
+      if (selectedFile) {
+        await persistPendingUpload(selectedFile, nextRecipientEmail.trim(), true);
+      }
       return;
     }
 
@@ -285,6 +391,7 @@ export default function UploadPage() {
     setSuccessMsg('');
     setError('');
     setShowEmailStep(false);
+    clearPendingUpload();
   }
 
   return (
@@ -502,7 +609,9 @@ export default function UploadPage() {
                       required
                       value={recipientEmail}
                       onChange={(e) => {
-                        setRecipientEmail(e.target.value);
+                        const nextEmail = e.target.value;
+                        setRecipientEmail(nextEmail);
+                        updatePendingUploadMetadata(nextEmail.trim(), showEmailStep);
                         setSuccessMsg('');
                         setError('');
                       }}
